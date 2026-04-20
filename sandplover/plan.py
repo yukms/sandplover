@@ -2161,7 +2161,7 @@ def compute_shoreline_distance(shore_mask, origin=(0, 0), return_distances=False
         Compute mean and stddev distance
 
         >>> mean, stddev = compute_shoreline_distance(
-        ...     sm, origin=[golf.meta["CTR"].data, golf.meta["L0"].data]
+        ...     sm, origin=[golf.meta["L0"].data, golf.meta["CTR"].data]
         ... )
 
         Make the plot
