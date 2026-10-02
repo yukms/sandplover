@@ -7,12 +7,16 @@ import xarray as xr
 from numba import njit
 from numba import prange
 from numba import set_num_threads
+from scipy import stats
 from scipy.ndimage import binary_fill_holes
 from scipy.signal import fftconvolve
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import ConvexHull
 from skimage import morphology
 
 from sandplover.mask import BaseMask
+from sandplover.mask import CenterlineMask
 from sandplover.mask import ChannelMask
 from sandplover.mask import ElevationMask
 from sandplover.mask import LandMask
@@ -3413,3 +3417,248 @@ def _compute_surface_deposit_time_from_etas(etas, stasis_tol=0.01):
     sfc_date = np.argmax(whr, axis=0)
 
     return sfc_date
+
+
+# =========================================================================
+# Mainstem Channel Selection & Channel Slope Analysis
+# =========================================================================
+
+def _get_array(arr, dtype=float):
+    """Internal helper to convert masks, DataArrays, or ndarrays to 2D numpy array."""
+    if arr is None:
+        return None
+    if hasattr(arr, "mask"):
+        arr = arr.mask
+    return np.asarray(getattr(arr, "values", arr), dtype=dtype)
+
+
+def _find_thalweg_path(
+    channel_mask,
+    water_depth=None,
+    land_mask=None,
+    pixel_size=25.0,
+    apex_y_max=23,
+    apex_cols=None,
+    depth_alpha=1.0,
+    downstream_delta_rows=12,
+):
+    """Find depth-weighted thalweg path along centerline network via Dijkstra search."""
+    if apex_cols is None:
+        apex_cols = range(140, 163)
+
+    ch_val = _get_array(channel_mask, dtype=bool)
+    depth_val = _get_array(water_depth, dtype=float)
+    land_val = _get_array(land_mask, dtype=bool)
+
+    # Centerline network from sandplover's CenterlineMask
+    skel_m = np.asarray(CenterlineMask.from_mask(ChannelMask.from_array(ch_val)).mask.values, dtype=bool)
+    if land_val is not None:
+        skel_m = skel_m & land_val
+
+    skel_coords = np.argwhere(skel_m)
+    n_pts = len(skel_coords)
+    if n_pts < 2:
+        return None, skel_m, skel_coords, np.empty((0, 2), dtype=int)
+
+    coord_to_idx = {tuple(pt): i for i, pt in enumerate(skel_coords)}
+    row_ind, col_ind, cost_data = [], [], []
+
+    for i, (r, c) in enumerate(skel_coords):
+        for dr, dc in ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)):
+            neighbor = (r + dr, c + dc)
+            if neighbor in coord_to_idx:
+                j = coord_to_idx[neighbor]
+                d_m = np.sqrt((dr * pixel_size) ** 2 + (dc * pixel_size) ** 2)
+                row_ind.append(i)
+                col_ind.append(j)
+                if depth_val is not None:
+                    d_mean = max((float(depth_val[r, c]) + float(depth_val[skel_coords[j][0], skel_coords[j][1]])) / 2.0, 0.05)
+                    cost_data.append(d_m / (d_mean ** depth_alpha))
+                else:
+                    cost_data.append(d_m)
+
+    apex_set = set(apex_cols)
+    inlet_idx = [i for i, (r, c) in enumerate(skel_coords) if r <= apex_y_max and c in apex_set] or [int(np.argmin(skel_coords[:, 0]))]
+    inlet_coords = skel_coords[inlet_idx]
+
+    # Dijkstra shortest / minimum-cost path
+    adj = csr_matrix((cost_data, (row_ind, col_ind)), shape=(n_pts, n_pts))
+    dist_matrix, pred = dijkstra(csgraph=adj, directed=False, indices=inlet_idx, return_predecessors=True)
+    if dist_matrix.ndim == 1:
+        dist_matrix, pred = dist_matrix[np.newaxis, :], pred[np.newaxis, :]
+
+    filled = np.where(np.isfinite(dist_matrix), dist_matrix, np.inf)
+    min_cost = np.min(filled, axis=0)
+    src_node = np.argmin(filled, axis=0)
+    finite = np.isfinite(min_cost)
+
+    if finite.sum() < 2:
+        return None, skel_m, skel_coords, inlet_coords
+
+    # Select termination target near delta shoreline
+    candidates = np.where(finite & (skel_coords[:, 0] >= int(skel_coords[finite, 0].max()) - downstream_delta_rows))[0]
+    target = int(candidates[np.argmin(min_cost[candidates])]) if len(candidates) > 0 else int(np.where(finite, min_cost, np.inf).argmin())
+
+    # Backtrack predecessor path
+    pred_row = pred[int(src_node[target])]
+    path, curr, seen = [], target, set()
+    while curr >= 0 and curr not in seen:
+        path.append(curr)
+        seen.add(curr)
+        curr = int(pred_row[curr])
+    path.reverse()
+
+    if len(path) < 2:
+        return None, skel_m, skel_coords, inlet_coords
+
+    return skel_coords[np.asarray(path, dtype=int)], skel_m, skel_coords, inlet_coords
+
+
+class MainstemPlanform(BasePlanform):
+    """Planform object representing the primary delta mainstem channel and longitudinal slope."""
+
+    def __init__(self, path_coords, skeleton_mask=None, pixel_size=25.0, inlet_coords=None, name=None):
+        super().__init__("mainstem", name=name)
+        self.pixel_size = float(pixel_size)
+        self.path_coords = np.asarray(path_coords, dtype=int)
+        self.skeleton_mask = np.asarray(skeleton_mask, dtype=bool) if skeleton_mask is not None else None
+        self.inlet_coords = np.asarray(inlet_coords, dtype=int) if inlet_coords is not None else np.empty((0, 2), dtype=int)
+
+        # Along-channel cumulative distance S (m)
+        if len(self.path_coords) > 1:
+            diffs = np.diff(self.path_coords, axis=0) * self.pixel_size
+            self._s_m = np.concatenate(([0.0], np.cumsum(np.sqrt((diffs ** 2).sum(axis=1)))))
+        else:
+            self._s_m = np.array([])
+
+        # Slope regression attributes
+        self.slope = np.nan
+        self.abs_slope = np.nan
+        self.m_fit = np.nan
+        self.b_fit = np.nan
+        self.r_squared = np.nan
+        self.p_value = np.nan
+        self.std_err = np.nan
+        self.thalweg_depth_m = np.nan
+        self.eta_profile = np.array([])
+
+    @property
+    def s_m(self):
+        """Along-channel cumulative distance array in meters starting from inlet (S=0)."""
+        return self._s_m
+
+    @property
+    def length_km(self):
+        """Total mainstem channel length in kilometers."""
+        return float(self._s_m[-1] / 1000.0) if len(self._s_m) > 0 else 0.0
+
+    @property
+    def n_points(self):
+        """Number of path coordinate nodes."""
+        return len(self.path_coords)
+
+    @classmethod
+    def extract(cls, channel_mask, water_depth=None, land_mask=None, pixel_size=25.0, apex_y_max=23, apex_cols=None, depth_alpha=1.0, downstream_delta_rows=12, name=None):
+        """Extract mainstem thalweg path using depth-weighted Dijkstra graph search."""
+        path, skel_m, _, inlet_pts = _find_thalweg_path(
+            channel_mask, water_depth=water_depth, land_mask=land_mask,
+            pixel_size=pixel_size, apex_y_max=apex_y_max, apex_cols=apex_cols,
+            depth_alpha=depth_alpha, downstream_delta_rows=downstream_delta_rows,
+        )
+        if path is None:
+            return None
+        return cls(path_coords=path, skeleton_mask=skel_m, pixel_size=pixel_size, inlet_coords=inlet_pts, name=name)
+
+    def sample_field(self, field):
+        """Sample any 2D scalar field along mainstem path coordinates."""
+        arr = _get_array(field, dtype=float)
+        return arr[self.path_coords[:, 0], self.path_coords[:, 1]]
+
+    def compute_slope(self, eta, water_depth=None):
+        """Fit bed slope via along-channel linear regression: eta(S) = m * S + b."""
+        if self.n_points < 2:
+            return {}
+
+        s_val = self.s_m
+        e_val = self.sample_field(eta)
+        finite = np.isfinite(s_val) & np.isfinite(e_val)
+        if finite.sum() < 2:
+            return {}
+
+        reg = stats.linregress(s_val[finite], e_val[finite])
+        self.m_fit = float(reg.slope)
+        self.b_fit = float(reg.intercept)
+        self.slope = float(reg.slope)
+        self.abs_slope = abs(float(reg.slope))
+        self.r_squared = float(reg.rvalue ** 2)
+        self.p_value = float(reg.pvalue)
+        self.std_err = float(reg.stderr)
+        self.eta_profile = e_val[finite]
+
+        if water_depth is not None:
+            d_val = self.sample_field(water_depth)
+            d_finite = d_val[np.isfinite(d_val)]
+            self.thalweg_depth_m = float(np.mean(d_finite)) if len(d_finite) > 0 else np.nan
+
+        return {
+            "abs_slope": self.abs_slope, "mean_slope": self.slope, "m_fit": self.m_fit,
+            "b_fit": self.b_fit, "r_squared": self.r_squared, "p_value": self.p_value,
+            "std_err": self.std_err, "max_dist_km": self.length_km, "n_skel_pts": int(finite.sum()),
+            "thalweg_depth_m": self.thalweg_depth_m, "s_m": s_val[finite], "e_skel": e_val[finite],
+            "coords": self.path_coords[finite],
+        }
+
+    def fitted_elevation(self):
+        """Return regression fitted elevation values: eta_fit = m * S + b."""
+        if not np.isfinite(self.m_fit):
+            raise ValueError("Call `compute_slope(eta)` before querying fitted elevations.")
+        return self.m_fit * self.s_m + self.b_fit
+
+    def show(self, ax=None, background=None, cmap="terrain", path_color="cyan", path_linewidth=2.0, show_skeleton=True, show_inlet=True, title=None):
+        """Plot the mainstem thalweg path over 2D elevation or skeleton background."""
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8, 6), dpi=120)
+
+        if background is not None:
+            im = ax.imshow(_get_array(background), origin="upper", cmap=cmap)
+            append_colorbar(im, ax=ax, label="Elevation (m)")
+        elif self.skeleton_mask is not None:
+            ax.imshow(self.skeleton_mask, origin="upper", cmap="Greys", alpha=0.3)
+
+        if show_skeleton and self.skeleton_mask is not None:
+            sk_pts = np.argwhere(self.skeleton_mask)
+            ax.plot(sk_pts[:, 1], sk_pts[:, 0], ".", color="gray", ms=1, alpha=0.4, label="Centerline")
+
+        if show_inlet and len(self.inlet_coords) > 0:
+            ax.plot(self.inlet_coords[:, 1], self.inlet_coords[:, 0], "o", color="gold", ms=4, label="Inlet Apex")
+
+        ax.plot(self.path_coords[:, 1], self.path_coords[:, 0], "-", color=path_color, linewidth=path_linewidth, label=f"Mainstem ({self.length_km:.2f} km)")
+        ax.set_xlabel("Cross-stream (col)")
+        ax.set_ylabel("Downstream (row)")
+        ax.set_title(title or f"Mainstem Channel Path ({self.name})")
+        ax.legend(loc="lower right", fontsize=8)
+        return ax
+
+    def show_profile(self, ax=None, color="#1f77b4", line_color="#d62728", label=None, show_stats=True):
+        """Plot longitudinal bed elevation profile and linear regression slope fit."""
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(7, 4), dpi=120)
+        if len(self.eta_profile) == 0:
+            raise ValueError("Elevation profile is empty. Call `compute_slope(eta)` first.")
+
+        s_km = self.s_m / 1000.0
+        ax.plot(s_km, self.eta_profile, "o-", color=color, ms=2, alpha=0.6, label=label or f"{self.name} bed profile")
+        ax.plot(s_km, self.fitted_elevation(), "--", color=line_color, linewidth=1.8, label=f"Fit (S={self.abs_slope:.5f}, R²={self.r_squared:.3f})")
+        ax.set_xlabel("Along-Channel Distance S (km)", fontsize=10)
+        ax.set_ylabel("Bed Elevation η (m)", fontsize=10)
+        ax.set_title(f"Longitudinal Bed Elevation & Slope ({self.name})", fontsize=11)
+        ax.grid(True, linestyle=":", alpha=0.5)
+        ax.legend(loc="upper right", fontsize=8)
+
+        if show_stats:
+            stat_text = f"Slope: {self.abs_slope:.5e} m/m\nR² = {self.r_squared:.3f}\nThalweg depth: {self.thalweg_depth_m:.2f} m\nLength: {self.length_km:.2f} km"
+            ax.text(0.03, 0.08, stat_text, transform=ax.transAxes, fontsize=8, verticalalignment="bottom",
+                    bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.8, edgecolor="lightgray"))
+        return ax
+
+
