@@ -3441,6 +3441,7 @@ def _find_thalweg_path(
     apex_cols=None,
     depth_alpha=1.0,
     downstream_delta_rows=12,
+    shoreline_mask=None,
 ):
     """Find depth-weighted thalweg path along centerline network via Dijkstra search."""
     if apex_cols is None:
@@ -3496,7 +3497,35 @@ def _find_thalweg_path(
         return None, skel_m, skel_coords, inlet_coords
 
     # Select termination target near delta shoreline
-    candidates = np.where(finite & (skel_coords[:, 0] >= int(skel_coords[finite, 0].max()) - downstream_delta_rows))[0]
+    if shoreline_mask is not None:
+        from scipy.ndimage import binary_dilation
+        if hasattr(shoreline_mask, 'mask') and hasattr(shoreline_mask.mask, 'values'):
+            shore_arr = np.asarray(shoreline_mask.mask.values, dtype=bool)
+        elif hasattr(shoreline_mask, 'values'):
+            shore_arr = np.asarray(shoreline_mask.values, dtype=bool)
+        else:
+            shore_arr = np.asarray(shoreline_mask, dtype=bool)
+
+        shore_dilated = binary_dilation(shore_arr, iterations=3)
+        intersect = finite & shore_dilated[skel_coords[:, 0], skel_coords[:, 1]]
+        candidates = np.where(intersect & (skel_coords[:, 0] > apex_y_max))[0]
+
+        if len(candidates) == 0:
+            shore_pts = np.argwhere(shore_arr)
+            if len(shore_pts) > 0:
+                from scipy.spatial import cKDTree
+                tree = cKDTree(shore_pts)
+                dists, _ = tree.query(skel_coords)
+                downstream_pts = np.where(finite & (skel_coords[:, 0] > apex_y_max))[0]
+                if len(downstream_pts) > 0:
+                    min_dist_val = dists[downstream_pts].min()
+                    candidates = downstream_pts[dists[downstream_pts] <= min_dist_val + 3.0]
+    else:
+        candidates = np.where(finite & (skel_coords[:, 0] >= int(skel_coords[finite, 0].max()) - downstream_delta_rows))[0]
+
+    if len(candidates) == 0:
+        candidates = np.where(finite)[0]
+
     target = int(candidates[np.argmin(min_cost[candidates])]) if len(candidates) > 0 else int(np.where(finite, min_cost, np.inf).argmin())
 
     # Backtrack predecessor path
@@ -3558,12 +3587,13 @@ class MainstemPlanform(BasePlanform):
         return len(self.path_coords)
 
     @classmethod
-    def extract(cls, channel_mask, water_depth=None, land_mask=None, pixel_size=25.0, apex_y_max=23, apex_cols=None, depth_alpha=1.0, downstream_delta_rows=12, name=None):
+    def extract(cls, channel_mask, water_depth=None, land_mask=None, pixel_size=25.0, apex_y_max=23, apex_cols=None, depth_alpha=1.0, downstream_delta_rows=12, shoreline_mask=None, name=None):
         """Extract mainstem thalweg path using depth-weighted Dijkstra graph search."""
         path, skel_m, _, inlet_pts = _find_thalweg_path(
             channel_mask, water_depth=water_depth, land_mask=land_mask,
             pixel_size=pixel_size, apex_y_max=apex_y_max, apex_cols=apex_cols,
             depth_alpha=depth_alpha, downstream_delta_rows=downstream_delta_rows,
+            shoreline_mask=shoreline_mask,
         )
         if path is None:
             return None
